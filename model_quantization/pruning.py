@@ -40,6 +40,10 @@ class ModelPruner:
         self.base_output_dir = Path(base_output_dir)
         self.pruned_dir = self.base_output_dir / "pruned"
         self.pruned_dir.mkdir(parents=True, exist_ok=True)
+        self.quantized_dir = self.base_output_dir / "quantized"
+        (self.quantized_dir / "INT8").mkdir(parents=True, exist_ok=True)
+        (self.quantized_dir / "INT4").mkdir(parents=True, exist_ok=True)
+        (self.quantized_dir / "FP16").mkdir(parents=True, exist_ok=True)
 
     def get_pruned_output_dir(self, model_name: str, sparsity: float) -> Path:
         """Get the output directory for a pruned model"""
@@ -500,6 +504,107 @@ class ModelPruner:
         except Exception as e:
             logger.error(f"Failed to save model: {str(e)}")
 
+    def export_to_gguf(
+        self,
+        pytorch_model_path: Path,
+        quantization: str = "q4_k_m",
+    ) -> bool:
+        """
+        Export pruned HF model to GGUF and quantize with llama.cpp.
+
+        Quantization options:
+          q4_k_m  — INT4, best quality/size tradeoff (recommended)
+          q8_0    — INT8, near-lossless, 2x smaller than FP16
+          q4_0    — INT4, smallest, lowest quality
+          f16     — FP16, no quantization (baseline)
+
+        Requires llama.cpp installed:
+          git clone https://github.com/ggerganov/llama.cpp
+          cmake -B build && cmake --build build --config Release -j
+        """
+        # Route to quantized/INT8, quantized/INT4, or quantized/FP16
+        quant_lower = quantization.lower()
+        if quant_lower == "f16":
+            precision_dir = self.quantized_dir / "FP16"
+        elif quant_lower in ("q8_0", "q8_1"):
+            precision_dir = self.quantized_dir / "INT8"
+        else:
+            precision_dir = self.quantized_dir / "INT4"
+
+        model_name = pytorch_model_path.name
+        gguf_dir = precision_dir / model_name
+        gguf_dir.mkdir(parents=True, exist_ok=True)
+
+        # F16 GGUF lives in FP16 folder and is reused across quantizations
+        f16_dir   = self.quantized_dir / "FP16" / model_name
+        f16_dir.mkdir(parents=True, exist_ok=True)
+        f16_path  = f16_dir / "model_f16.gguf"
+        quant_path = gguf_dir / f"model_{quantization}.gguf"
+
+        # Locate llama.cpp tools
+        convert_script  = self._find_llama_cpp_tool("convert_hf_to_gguf.py")
+        quantize_binary = self._find_llama_cpp_tool("llama-quantize")
+
+        if not convert_script:
+            logger.error("convert_hf_to_gguf.py not found. Clone llama.cpp and build it first.")
+            logger.error("  git clone https://github.com/ggerganov/llama.cpp && cmake -B build && cmake --build build -j")
+            return False
+
+        # Step 1: HF safetensors → GGUF F16
+        logger.info(f"Converting {pytorch_model_path} → GGUF F16...")
+        result = subprocess.run(
+            ["python3", convert_script, str(pytorch_model_path),
+             "--outfile", str(f16_path), "--outtype", "f16"],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            logger.error(f"GGUF conversion failed:\n{result.stderr}")
+            return False
+        logger.info(f"✓ F16 GGUF saved: {f16_path}")
+
+        # Step 2: quantize GGUF → INT4/INT8
+        if quantization.lower() == "f16":
+            logger.info("Skipping quantization (f16 requested)")
+            return True
+
+        if not quantize_binary:
+            logger.error("llama-quantize binary not found. Build llama.cpp first.")
+            return False
+
+        quant_type = quantization.upper()
+        logger.info(f"Quantizing GGUF to {quant_type}...")
+        result = subprocess.run(
+            [quantize_binary, str(f16_path), str(quant_path), quant_type],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            logger.error(f"Quantization failed:\n{result.stderr}")
+            return False
+
+        size_gb = quant_path.stat().st_size / 1e9
+        logger.info(f"✓ Quantized GGUF saved: {quant_path} ({size_gb:.2f} GB)")
+        return True
+
+    def _find_llama_cpp_tool(self, name: str) -> Optional[str]:
+        """Search common locations for llama.cpp tools."""
+        import shutil
+        # Check PATH first
+        found = shutil.which(name)
+        if found:
+            return found
+        # Common local build paths
+        candidates = [
+            Path.home() / "llama.cpp" / name,
+            Path.home() / "llama.cpp" / "build" / "bin" / name,
+            Path("/usr/local/bin") / name,
+            Path("./llama.cpp") / name,
+            Path("./llama.cpp/build/bin") / name,
+        ]
+        for p in candidates:
+            if p.exists():
+                return str(p)
+        return None
+
     def export_to_onnx(
         self,
         pytorch_model_path: Path,
@@ -574,6 +679,8 @@ class ModelPruner:
         sparsity: float = 0.5,
         pruning_method: str = "wanda",
         export_onnx: bool = True,
+        export_gguf: bool = False,
+        gguf_quantization: str = "q4_k_m",
         num_calibration_samples: int = 128,
         device: str = "cpu",
         skip_existing: bool = True
@@ -761,6 +868,29 @@ class ModelPruner:
                     results['errors'].append("ONNX export failed")
         else:
             logger.info("\nSkipping ONNX export. Set export_onnx=True for full workflow.")
+
+        # Step 7: Export to GGUF (optional, requires llama.cpp)
+        if export_gguf and results['pytorch_model_path']:
+            logger.info("\n" + "-"*80)
+            logger.info(f"Step 7: Exporting pruned model to GGUF ({gguf_quantization.upper()})...")
+            logger.info("-"*80)
+            gguf_success = self.export_to_gguf(
+                Path(results['pytorch_model_path']),
+                quantization=gguf_quantization,
+            )
+            if gguf_success:
+                quant_lower = gguf_quantization.lower()
+                if quant_lower == "f16":
+                    precision_dir = self.quantized_dir / "FP16"
+                elif quant_lower in ("q8_0", "q8_1"):
+                    precision_dir = self.quantized_dir / "INT8"
+                else:
+                    precision_dir = self.quantized_dir / "INT4"
+                model_name = Path(results['pytorch_model_path']).name
+                results['gguf_model_path'] = str(precision_dir / model_name / f"model_{gguf_quantization}.gguf")
+                logger.info(f"✓ GGUF export successful: {results['gguf_model_path']}")
+            else:
+                results['errors'].append("GGUF export failed")
 
         results['success'] = True
 
